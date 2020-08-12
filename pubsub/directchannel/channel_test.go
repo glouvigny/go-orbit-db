@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -13,17 +12,20 @@ import (
 	"berty.tech/go-orbit-db/iface"
 	"github.com/libp2p/go-libp2p-core/host"
 	mocknet "github.com/libp2p/go-libp2p/p2p/net/mock"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestInitDirectChannelFactory(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 
 	mn := mocknet.New(ctx)
 
-	var err error
+	var (
+		err           error
+		reportedErr   error
+		muReportedErr sync.Mutex
+	)
 	count := 10
 	hosts := make([]host.Host, count)
 	directChannelsFactories := make([]iface.DirectChannelFactory, count)
@@ -55,73 +57,107 @@ func TestInitDirectChannelFactory(t *testing.T) {
 			expectedMessages++
 
 			go func(i, j int) {
-				ctx, cancel := context.WithCancel(ctx)
+				initWg := sync.WaitGroup{}
+				sentWg := sync.WaitGroup{}
+				initWg.Add(2)
 
-				subWg := sync.WaitGroup{}
-				subWg.Add(2)
+				defer func() {
+					initWg.Wait()
+					sentWg.Wait()
+					wg.Done()
+				}()
+
+				ctx, cancel := context.WithCancel(ctx)
+				defer cancel()
 
 				expectedMessage := []byte(fmt.Sprintf("test-%d-%d", i, j))
 
 				ch1, err := directChannelsFactories[j](ctx, hosts[i].ID(), nil)
-				assert.NoError(t, err)
+				if err != nil {
+					muReportedErr.Lock()
+					reportedErr = err
+					muReportedErr.Unlock()
+					return
+				}
+				defer func() { _ = ch1.Close() }()
 
 				ch2, err := directChannelsFactories[i](ctx, hosts[j].ID(), nil)
-				assert.NoError(t, err)
+				if err != nil {
+					muReportedErr.Lock()
+					reportedErr = err
+					muReportedErr.Unlock()
+					return
+				}
+
+				defer func() { _ = ch2.Close() }()
+
+				var (
+					err1, err2 error
+				)
 
 				go func() {
-					err := ch1.Connect(ctx)
-					assert.NoError(t, err)
+					defer initWg.Done()
 
-					subWg.Done()
+					err1 = ch1.Connect(ctx)
+					if err1 != nil {
+						muReportedErr.Lock()
+						reportedErr = err1
+						muReportedErr.Unlock()
+						return
+					}
 				}()
 
 				go func() {
-					err := ch2.Connect(ctx)
-					assert.NoError(t, err)
+					defer initWg.Done()
 
-					subWg.Done()
+					err2 = ch2.Connect(ctx)
+					if err2 != nil {
+						muReportedErr.Lock()
+						reportedErr = err2
+						muReportedErr.Unlock()
+						return
+					}
 				}()
 
-				subWg.Wait()
+				initWg.Wait()
 
-				var valOK uint32 = 1
+				if err1 != nil || err2 != nil {
+					return
+				}
 
-				subWg.Add(1)
+				initWg.Add(1)
+				sentWg.Add(2)
 
 				go func() {
 					defer cancel()
+					defer sentWg.Done()
 
 					sub := ch2.Subscribe(ctx)
-					subWg.Done()
+					initWg.Done()
 
 					for evt := range sub {
 						if e, ok := evt.(*iface.EventPubSubPayload); ok {
 							if bytes.Equal(e.Payload, expectedMessage) {
-								count := atomic.AddUint32(&receivedMessages, 1)
-								t.Log(fmt.Sprintf("successfully received message from %d for %d (%d)", i, j, count))
-								atomic.StoreUint32(&valOK, 1)
+								atomic.AddUint32(&receivedMessages, 1)
 								return
 							}
 						}
 					}
-
-					t.Log(fmt.Sprintf("failed to receive message from %d for %d", i, j))
-					atomic.StoreUint32(&valOK, 1)
 				}()
 
-				subWg.Wait()
+				initWg.Wait()
 
 				err = ch1.Send(ctx, expectedMessage)
-				if err != io.EOF {
-					assert.NoError(t, err)
+				sentWg.Done()
+
+				if err != nil {
+					muReportedErr.Lock()
+					reportedErr = err
+					muReportedErr.Unlock()
+					return
 				}
 
-				<-ctx.Done()
-				wg.Done()
-
-				if atomic.LoadUint32(&valOK) == 0 {
-					t.Log(fmt.Sprintf("wtf from %d for %d", i, j))
-				}
+				sentWg.Wait()
 			}(i, j)
 		}
 	}
@@ -132,7 +168,8 @@ func TestInitDirectChannelFactory(t *testing.T) {
 	}()
 
 	<-ctx.Done()
-	if !assert.Equal(t, int(expectedMessages), int(atomic.LoadUint32(&receivedMessages))) {
-		time.Sleep(time.Second * 10)
-	}
+	require.Equal(t, int(expectedMessages), int(atomic.LoadUint32(&receivedMessages)))
+	muReportedErr.Lock()
+	require.NoError(t, reportedErr)
+	muReportedErr.Unlock()
 }

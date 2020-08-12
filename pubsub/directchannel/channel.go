@@ -31,17 +31,24 @@ type channel struct {
 	receiverID p2pcore.PeerID
 	logger     *zap.Logger
 	holder     *channelHolder
-	stream     io.Writer
-	muStream   sync.Mutex
+	stream     chan io.Writer
+	closed     bool
 }
 
 func (c *channel) Send(ctx context.Context, bytes []byte) error {
-	c.muStream.Lock()
-	stream := c.stream
-	c.muStream.Unlock()
+	c.holder.muExpected.Lock()
+	defer c.holder.muExpected.Unlock()
+
+	var stream io.Writer
+
+	select {
+	case stream = <-c.stream:
+	case <-ctx.Done():
+		return fmt.Errorf("stream is not opened")
+	}
 
 	if stream == nil {
-		return fmt.Errorf("stream is not opened")
+		return fmt.Errorf("stream is nil wtf")
 	}
 
 	if len(bytes) > math.MaxUint16 {
@@ -60,10 +67,6 @@ func (c *channel) Send(ctx context.Context, bytes []byte) error {
 }
 
 func (c *channel) Close() error {
-	c.muStream.Lock()
-	c.stream = nil
-	c.muStream.Unlock()
-
 	return nil
 }
 
@@ -78,8 +81,12 @@ func (c *channel) Connect(ctx context.Context) error {
 		ctx, cancel := context.WithTimeout(ctx, time.Second*5)
 		id = c.holder.hostProtocolID(c.receiverID)
 		c.holder.muExpected.Lock()
-		streamChan := c.holder.expectedPID[id]
+		streamChan, ok := c.holder.expectedPID[id]
 		c.holder.muExpected.Unlock()
+
+		if !ok {
+			return fmt.Errorf("unexpected pid")
+		}
 
 		select {
 		case stream = <-streamChan:
@@ -98,9 +105,20 @@ func (c *channel) Connect(ctx context.Context) error {
 		}
 	}
 
-	c.muStream.Lock()
-	c.stream = stream
-	c.muStream.Unlock()
+	if stream == nil {
+		return fmt.Errorf("unable to acquire stream")
+	}
+
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				close(c.stream)
+				return
+			case c.stream <- io.Writer(stream):
+			}
+		}
+	}()
 
 	go func() {
 		for {
@@ -163,6 +181,7 @@ func (h *channelHolder) NewChannel(ctx context.Context, receiver p2pcore.PeerID,
 		receiverID: receiver,
 		logger:     opts.Logger,
 		holder:     h,
+		stream:     make(chan io.Writer),
 	}
 
 	if strings.Compare(h.host.ID().String(), receiver.String()) < 0 {
@@ -174,6 +193,7 @@ func (h *channelHolder) NewChannel(ctx context.Context, receiver p2pcore.PeerID,
 		go func() {
 			<-ctx.Done()
 			h.muExpected.Lock()
+			close(h.expectedPID[id])
 			delete(h.expectedPID, id)
 			h.muExpected.Unlock()
 		}()
@@ -188,21 +208,20 @@ func (h *channelHolder) hostProtocolID(receiver p2pcore.PeerID) protocol.ID {
 
 func (h *channelHolder) checkExpectedStream(s string) bool {
 	h.muExpected.Lock()
-	_, ok := h.expectedPID[protocol.ID(s)]
-	h.muExpected.Unlock()
+	defer h.muExpected.Unlock()
 
+	_, ok := h.expectedPID[protocol.ID(s)]
 	return ok
 }
 
 func (h *channelHolder) incomingConnHandler(stream network.Stream) {
 	h.muExpected.Lock()
+	defer h.muExpected.Unlock()
 
 	ch, ok := h.expectedPID[stream.Protocol()]
 	if !ok {
 		return
 	}
-
-	h.muExpected.Unlock()
 
 	ch <- stream
 }
